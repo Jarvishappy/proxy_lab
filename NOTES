@@ -1,0 +1,21 @@
+2015-7-2
+Milestone
+1. 先实现一个最最简单的echo client, echo serve，不带error handling
+2. 逐步增强功能，实现最简单的的proxy
+3. 改造成多线程版本
+
+2015-7-4
+
+1. 读socket的时候，read()返回0代表什么？
+答：表示peer socket关闭了(EOF, no more data to be read)。如果是server检测到
+这个事件，那么server就应该把clientfd给关闭。server可以继续往这个clientfd写入数据，
+不会报错。
+
+2. 写入一个closed socket，会报什么错?
+答：write() return -1 and set errno to EBADF
+
+3. read()一个closed socket会报什么错？
+答：read() return -1 and set errno to EBADF
+
+
+
