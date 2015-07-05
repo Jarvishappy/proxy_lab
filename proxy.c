@@ -20,34 +20,61 @@
 #define HOST "Host"
 
 /**
- * Represents a HTTP message
+ * Represents a HTTP request
  * TODO: 没必要把整个HTTP message全部读到内存里，尤其是header
  * 读完request line之后就有足够的参数connect到target server了，
  * 然后就可以读一行写一行，这样能节省很多内存
  */
 typedef struct {
     int content_len;
-    char method[10];
-    char version[16];
-    char host[128];
     int port;
+    char method[5];
+    char host[128];
     char path[1024];
-    char headers[MAXHEAD][512];
-    char body[MAXBUF];
-} httpmsg_t;
+    char req_uri[MAXLINE];
+} httpmeta_t;
+
+typedef struct {
+    char linebuf[MAXLINE];
+    char bodybuf[MAXBUF];
+} io_buf_t;
 
 /*
  * Function prototypes
  */
 int parse_uri(char *uri, char *target_addr, char *path, int *port);
 void format_log_entry(char *logstring, struct sockaddr_in *sockaddr, char *uri, int size);
-void write_log(FILE *fp, char *record);
-void parse_http_msg(httpmsg_t *httpmsg, int clientfd);
+void write_log(FILE *fp, char *logstring);
 
-void forward_request(httpmsg_t *httpmsg, int targetfd);
-void send_request_line(httpmsg_t *httpmsg, int targetfd);
-void send_headers(httpmsg_t *httpmsg, int targetfd);
-void send_body(httpmsg_t *httpmsg, int targetfd);
+/**
+ * 解析HTTP Request的第一行，获取目的server的host和port
+ */
+int parse_request_line(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
+{
+    if (Rio_readlineb(rio_buf, io_buf->linebuf, MAXLINE) == 0)
+        return 0;
+
+    char *p = io_buf->linebuf;
+    char *delim;
+
+    delim = strchr(p, ' ');
+    *delim = '\0';
+    /* p points to the method */
+    strncpy(httpmeta->method, p, strlen(p) + 1);
+
+    p = delim + 1;
+    delim = strchr(p, ' ');
+    *delim = '\0';
+    /* p points to the uri */
+    strncpy(httpmeta->req_uri, p, strlen(p) + 1);
+    parse_uri(p, httpmeta->host, httpmeta->path, &httpmeta->port);
+
+    return 1;
+}
+
+int get_header(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf);
+int get_body(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf);
+
 
 /*
  * main - Main routine for the proxy program
@@ -63,7 +90,7 @@ int main(int argc, char **argv)
     }
 
     port = atoi(argv[1]);
-    int listenfd, browserfd;
+    int listenfd, browserfd, targetfd;
     struct sockaddr_in browser_addr;
     socklen_t addrlen = sizeof(browser_addr);
 
@@ -71,73 +98,101 @@ int main(int argc, char **argv)
     listenfd = Open_listenfd(port);
 
     /* char logstring[MAXBUF] = {0}; */
-    FILE *flogp = fopen("proxy.log", "w");
+    FILE *flogp = fopen("proxy.log", "a+");
     if (!flogp)
         unix_error("fopen");
 
     printf("server: started on port: %d.\n", port);
 
     /* we only need two buffer */
-    char bodybuf[MAXBUF], linebuf[MAXLINE];
+    rio_t rio_buf;
+    io_buf_t io_buf;
     char logstring[MAXLINE];
-    char *delim;
+    size_t nbyte;
+    int rc;
 
     while (1) {
         browserfd = Accept(listenfd, (struct sockaddr *)&browser_addr, &addrlen);
-        DBG(("accept a new connection\n"));
-        httpmsg_t httpmsg;
-        memset(&httpmsg, 0, sizeof(httpmsg));
+        DBG(("accept a new connection"));
 
-        parse_http_msg(&httpmsg, browserfd);
+        httpmeta_t httpmeta;
+        memset(&httpmeta, 0, sizeof(httpmeta));
+        Rio_readinitb(&rio_buf, browserfd);
 
-        int targetfd;
-        targetfd = Open_clientfd(httpmsg.host, httpmsg.port);
 
-        /* 把请求转发到target server */
-        send_request_line(&httpmsg, targetfd);
-        send_headers(&httpmsg, targetfd);
-        send_body(&httpmsg, targetfd);
+        /* parse request line */
+        rc = parse_request_line(&rio_buf, &httpmeta, &io_buf);
 
-        /* 接收target server的response */
-        rio_t rio_buf;
-        size_t nbyte = 0;
-        int len;
-        int res_content_len = 0;
-        Rio_readinitb(&rio_buf, targetfd);
-        /* 一行行读，因为要获取Content-Length */
+        DBG(("host: %s, port: %d", httpmeta.host, httpmeta.port));
+        DBG(("method: %s, path: %s", httpmeta.method, httpmeta.path));
+
+        /* connect to target server */
+        targetfd = Open_clientfd(httpmeta.host, httpmeta.port);
+
+        /* send request message to target server */
+
+        /* send request line */
+        sprintf(io_buf.linebuf, "%s %s HTTP/1.1\r\n", httpmeta.method, httpmeta.path);
+        Rio_writen(targetfd, io_buf.linebuf, strlen(io_buf.linebuf));
+
+        /* send headers */
         do {
-            Rio_readlineb(&rio_buf, linebuf, MAXLINE);
-            len = strlen(linebuf);
-            if (strncmp(CRLF, linebuf, strlen(CRLF)) == 0)
+            rc = get_header(&rio_buf, &httpmeta, &io_buf);
+            if (rc == 0) /* EOF */
                 break;
+            Rio_writen(targetfd, io_buf.linebuf, strlen(io_buf.linebuf));
+        } while (rc != 2);
 
-            if (strncmp(CONTENT_LENGTH, linebuf, strlen(CONTENT_LENGTH)) == 0) {
-                delim = strchr(linebuf, ':');
-                res_content_len = atoi(delim + 1);
-            }
+        /* handle closed socket event */
+        if (rc == 0)
+            app_error("get_header encounter EOF");
 
-            Rio_writen(targetfd, linebuf, len);
-            nbyte += len;
-        } while (1);
 
-        /* send response body if needed */
-        if (res_content_len > 0) {
-            Rio_readnb(&rio_buf, bodybuf, res_content_len);
-            Rio_writen(targetfd, bodybuf, res_content_len);
-            nbyte += res_content_len;
+        /* send body */
+        if ((rc = get_body(&rio_buf, &httpmeta, &io_buf)) == 1) {
+            Rio_writen(targetfd, io_buf.bodybuf, httpmeta.content_len);
         }
 
-        if (strncasecmp(httpmsg.path, "http://", 7) == 0)
-            strncpy(linebuf, httpmsg.path, strlen(httpmsg.path) + 1);
-        else {
-            if (httpmsg.port == 0)
-                sprintf(linebuf, "http://%s/%s", httpmsg.host, httpmsg.path);
-            else
-                sprintf(linebuf, "http://%s:%d/%s", httpmsg.host, httpmsg.port, httpmsg.path);
+        /* handle closed socket event */
+        if (rc == 0)
+            app_error("get_body encounter EOF");
+
+        DBG(("forwarded request to target server"));
+
+        /* receive response from target server */
+        Rio_readinitb(&rio_buf, targetfd);
+        nbyte = 0;
+        do {
+            rc = get_header(&rio_buf, &httpmeta, &io_buf);
+            if (rc == 0) /* EOF */
+                break;
+            nbyte += strlen(io_buf.linebuf);
+            Rio_writen(browserfd, io_buf.linebuf, strlen(io_buf.linebuf));
+        } while (rc != 2);
+
+        if (rc == 0)
+            app_error("get_header encounter EOF");
+
+        DBG(("send response headers to browser"));
+
+        /* send body */
+        if ((rc = get_body(&rio_buf, &httpmeta, &io_buf)) == 1) {
+            nbyte += httpmeta.content_len;
+            Rio_writen(browserfd, io_buf.bodybuf, httpmeta.content_len);
         }
 
-        format_log_entry(logstring, &browser_addr, linebuf, nbyte);
-        write_log(flogp, linebuf);
+        if (rc == 0)
+            app_error("get_body encounter EOF");
+
+        DBG(("send response body to browser"));
+
+        /* logging to file */
+        format_log_entry(logstring, &browser_addr, httpmeta.req_uri, nbyte);
+        write_log(flogp, logstring);
+
+        DBG(("log to file"));
+
+        break;
     }
 
     Close(listenfd);
@@ -146,110 +201,53 @@ int main(int argc, char **argv)
     exit(0);
 }
 
-void send_request_line(httpmsg_t *httpmsg, int targetfd)
+void write_log(FILE *fp, char *logstring)
 {
-    char linebuf[1024] = {0};
-    sprintf(linebuf, "%s %s %s", httpmsg->method, httpmsg->path, httpmsg->version);
-    Rio_writen(targetfd, linebuf, strlen(linebuf));
+    fprintf(fp, "%s\n", logstring);
 }
 
-void send_headers(httpmsg_t *httpmsg, int targetfd)
+/**
+ * read a header in io_buf.linebuf
+ * @return
+ *         0 for EOF
+ *         1 for successfully read a header
+ *         2 for CRLF
+ */
+int get_header(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
 {
-    int i;
-    for (i = 0; i < MAXHEAD; i++) {
-        if (strlen(httpmsg->headers[i]) <= 0)
-            continue;
-        Rio_writen(targetfd, httpmsg->headers[i], strlen(httpmsg->headers[i]));
-    }
-    Rio_writen(targetfd, CRLF, strlen(CRLF));
-}
-
-void send_body(httpmsg_t *httpmsg, int targetfd)
-{
-    if (httpmsg->content_len > 0)
-        Rio_writen(targetfd, httpmsg->body, httpmsg->content_len);
-}
-
-
-void parse_http_msg(httpmsg_t *httpmsg, int clientfd)
-{
-    rio_t rio_buf;
-    /* open log file */
-    char linebuf[MAXBUF] = {0};
-    Rio_readinitb(&rio_buf, clientfd);
-
-    /* read first line */
-    if (Rio_readlineb(&rio_buf, linebuf, MAXBUF) == 0) {
-        DBG(("client closed socket"));
-        exit(1);
-    }
-
-    /* parse first line */
-    char *p = linebuf;
+    /* parse all headers */
     char *delim;
 
-    /* get the uri component from HTTP message, preserve trailing "\r\n" */
-    while (p != NULL) {
-        delim = strchr(p, ' ');
-        if (delim != NULL)
-            *delim = '\0';
+    if (Rio_readlineb(rio_buf, io_buf->linebuf, MAXBUF) == 0)
+        return 0;
 
-        if (strlen(httpmsg->method) == 0)
-            strncpy(httpmsg->method, p, strlen(p) + 1);
-        else if (strlen(httpmsg->path) == 0)
-            strncpy(httpmsg->path, p, strlen(p) + 1);
-        else
-            strncpy(httpmsg->version, p, strlen(p) + 1);
+    /* encounter the CRLF following headers */
+    if (strncmp(CRLF, io_buf->linebuf, strlen(CRLF)) == 0)
+        return 2;
 
-        p = delim == NULL ? delim : delim + 1;
+    /* encounter "Content-Length" means there is payload in the request */
+    if (strncmp(CONTENT_LENGTH, io_buf->linebuf, strlen(CONTENT_LENGTH)) == 0) {
+        delim = strchr(io_buf->linebuf, ':');
+        httpmeta->content_len = atoi(delim + 1);
     }
 
-    /* parse all headers */
-    int i = 0;
-    do {
-        if (Rio_readlineb(&rio_buf, linebuf, MAXBUF) == 0) {
-            DBG(("client closed socket"));
-            exit(1);
-        }
-        /* encounter the CRLF following headers */
-        if (strncmp(CRLF, linebuf, strlen(CRLF)) == 0)
-            break;
+    return 1;
+}
 
-        /* preserve trailing "\r\n" */
-        strncpy(httpmsg->headers[i++], linebuf, strlen(linebuf) + 1);
+/**
+ * @return 0 for EOF
+ *         1 successfully read the body
+ *         2 for read noting
+ */
+int get_body(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
+{
+    if (httpmeta->content_len <= 0)
+        return 2;
 
-        /* encounter "Content-Length" means there is payload in the request */
-        if (strncmp(CONTENT_LENGTH, linebuf, strlen(CONTENT_LENGTH)) == 0) {
-            delim = strchr(linebuf, ':');
-            httpmsg->content_len = atoi(delim + 1);
-        } else if (strncmp(HOST, linebuf, strlen(HOST)) == 0) {
-            delim = strchr(linebuf, ':');
-            p = delim + 1;
-            while (*p == ' ')
-                p++;
-
-            /* 看host后面有没有跟着端口号 */
-            delim = strchr(p, ':');
-            if (delim == NULL) {
-                delim = strchr(p, '\r');
-                if (delim)
-                    *delim = '\0';
-
-                strncpy(httpmsg->host, p, strlen(p) + 1);
-            } else {
-                *delim = '\0';
-                delim += 1;
-                strncpy(httpmsg->host, p, strlen(p) + 1);
-                httpmsg->port = atoi(delim);
-            }
-        }
-
-
-    } while (1);
-
-    /* read all body */
-    if (httpmsg->content_len > 0)
-        Rio_readnb(&rio_buf, httpmsg->body, httpmsg->content_len);
+    if (Rio_readnb(rio_buf, io_buf->bodybuf, httpmeta->content_len) == 0)
+        return 0;
+    else
+        return 1;
 }
 
 
@@ -263,6 +261,8 @@ void parse_http_msg(httpmsg_t *httpmsg, int clientfd)
  */
 int parse_uri(char *uri, char *hostname, char *pathname, int *port)
 {
+    DBG(("uri: %s", uri));
+
     char *hostbegin;
     char *hostend;
     char *pathbegin;
@@ -291,7 +291,7 @@ int parse_uri(char *uri, char *hostname, char *pathname, int *port)
         pathname[0] = '\0';
     }
     else {
-        pathbegin++;
+        /* pathbegin++; 这里应该是bug */
         strcpy(pathname, pathbegin);
     }
 
@@ -331,7 +331,7 @@ void format_log_entry(char *logstring, struct sockaddr_in *sockaddr,
 
 
     /* Return the formatted log entry string */
-    sprintf(logstring, "%s: %d.%d.%d.%d %s", time_str, a, b, c, d, uri);
+    sprintf(logstring, "%s: %d.%d.%d.%d %s %d", time_str, a, b, c, d, uri, size);
 }
 
 
