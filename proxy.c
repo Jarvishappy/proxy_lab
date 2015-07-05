@@ -31,8 +31,8 @@ typedef struct {
     char method[5];
     char host[128];
     char path[1024];
-    char req_uri[MAXLINE];
-} httpmeta_t;
+    char uri[MAXLINE];
+} reqmeta_t;
 
 typedef struct {
     char linebuf[MAXLINE];
@@ -49,7 +49,7 @@ void write_log(FILE *fp, char *logstring);
 /**
  * 解析HTTP Request的第一行，获取目的server的host和port
  */
-int parse_request_line(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
+int parse_request_line(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf)
 {
     if (Rio_readlineb(rio_buf, io_buf->linebuf, MAXLINE) == 0)
         return 0;
@@ -60,21 +60,23 @@ int parse_request_line(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
     delim = strchr(p, ' ');
     *delim = '\0';
     /* p points to the method */
-    strncpy(httpmeta->method, p, strlen(p) + 1);
+    strncpy(reqmeta->method, p, strlen(p) + 1);
 
     p = delim + 1;
     delim = strchr(p, ' ');
     *delim = '\0';
     /* p points to the uri */
-    strncpy(httpmeta->req_uri, p, strlen(p) + 1);
-    parse_uri(p, httpmeta->host, httpmeta->path, &httpmeta->port);
+    strncpy(reqmeta->uri, p, strlen(p) + 1);
+    parse_uri(p, reqmeta->host, reqmeta->path, &reqmeta->port);
 
     return 1;
 }
 
-int get_header(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf);
-int get_body(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf);
+int get_header(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf);
+int get_body(rio_t *rio_buf, int content_len, io_buf_t *io_buf);
 
+ssize_t send_headers(int fd, rio_t *rio_buf, io_buf_t *io_buf, reqmeta_t *reqmeta);
+ssize_t send_body(int fd, rio_t *rio_buf, io_buf_t *io_buf, int content_len);
 
 /*
  * main - Main routine for the proxy program
@@ -108,91 +110,61 @@ int main(int argc, char **argv)
     rio_t rio_buf;
     io_buf_t io_buf;
     char logstring[MAXLINE];
-    size_t nbyte;
+    ssize_t nbyte;
     int rc;
 
     while (1) {
         browserfd = Accept(listenfd, (struct sockaddr *)&browser_addr, &addrlen);
         DBG(("accept a new connection"));
 
-        httpmeta_t httpmeta;
-        memset(&httpmeta, 0, sizeof(httpmeta));
+        reqmeta_t reqmeta;
+        memset(&reqmeta, 0, sizeof(reqmeta));
         Rio_readinitb(&rio_buf, browserfd);
 
-
-        /* parse request line */
-        rc = parse_request_line(&rio_buf, &httpmeta, &io_buf);
-
-        DBG(("host: %s, port: %d", httpmeta.host, httpmeta.port));
-        DBG(("method: %s, path: %s", httpmeta.method, httpmeta.path));
-
-        /* connect to target server */
-        targetfd = Open_clientfd(httpmeta.host, httpmeta.port);
-
-        /* send request message to target server */
-
-        /* send request line */
-        sprintf(io_buf.linebuf, "%s %s HTTP/1.1\r\n", httpmeta.method, httpmeta.path);
-        Rio_writen(targetfd, io_buf.linebuf, strlen(io_buf.linebuf));
-
-        /* send headers */
-        do {
-            rc = get_header(&rio_buf, &httpmeta, &io_buf);
-            if (rc == 0) /* EOF */
+        while (1) {
+            /* parse request line */
+            rc = parse_request_line(&rio_buf, &reqmeta, &io_buf);
+            if (rc == 0) {
+                DBG(("parse_request_line encounter EOF"));
                 break;
+            }
+
+            /* connect to target server */
+            targetfd = Open_clientfd(reqmeta.host, reqmeta.port);
+
+            /* send HTTP request to target server */
+            /* request line */
+            sprintf(io_buf.linebuf, "%s %s HTTP/1.1\r\n", reqmeta.method, reqmeta.path);
             Rio_writen(targetfd, io_buf.linebuf, strlen(io_buf.linebuf));
-        } while (rc != 2);
-
-        /* handle closed socket event */
-        if (rc == 0)
-            app_error("get_header encounter EOF");
-
-
-        /* send body */
-        if ((rc = get_body(&rio_buf, &httpmeta, &io_buf)) == 1) {
-            Rio_writen(targetfd, io_buf.bodybuf, httpmeta.content_len);
-        }
-
-        /* handle closed socket event */
-        if (rc == 0)
-            app_error("get_body encounter EOF");
-
-        DBG(("forwarded request to target server"));
-
-        /* receive response from target server */
-        Rio_readinitb(&rio_buf, targetfd);
-        nbyte = 0;
-        do {
-            rc = get_header(&rio_buf, &httpmeta, &io_buf);
-            if (rc == 0) /* EOF */
+            /* headers */
+            if (send_headers(targetfd, &rio_buf, &io_buf, &reqmeta) == -1 ||
+                send_body(targetfd, &rio_buf, &io_buf, reqmeta.content_len) == -1)
                 break;
-            nbyte += strlen(io_buf.linebuf);
-            Rio_writen(browserfd, io_buf.linebuf, strlen(io_buf.linebuf));
-        } while (rc != 2);
 
-        if (rc == 0)
-            app_error("get_header encounter EOF");
+            DBG(("forwarded request to target server"));
 
-        DBG(("send response headers to browser"));
+            /**** send response back to browser *****/
+            Rio_readinitb(&rio_buf, targetfd);
+            ssize_t rc;
+            nbyte = 0;
 
-        /* send body */
-        if ((rc = get_body(&rio_buf, &httpmeta, &io_buf)) == 1) {
-            nbyte += httpmeta.content_len;
-            Rio_writen(browserfd, io_buf.bodybuf, httpmeta.content_len);
+            if ((rc = send_headers(browserfd, &rio_buf, &io_buf, &reqmeta)) == -1)
+                break;
+            nbyte += rc;
+
+            if ((rc = send_body(browserfd, &rio_buf, &io_buf, reqmeta.content_len)) == -1)
+                break;
+            nbyte += rc;
+
+            /* logging to file */
+            format_log_entry(logstring, &browser_addr, reqmeta.uri, nbyte);
+            write_log(flogp, logstring);
+
+            DBG(("log to file"));
         }
+        DBG(("browser closed the socket"));
+        Close(browserfd);
 
-        if (rc == 0)
-            app_error("get_body encounter EOF");
-
-        DBG(("send response body to browser"));
-
-        /* logging to file */
-        format_log_entry(logstring, &browser_addr, httpmeta.req_uri, nbyte);
-        write_log(flogp, logstring);
-
-        DBG(("log to file"));
-
-        break;
     }
 
     Close(listenfd);
@@ -201,50 +173,87 @@ int main(int argc, char **argv)
     exit(0);
 }
 
+/**
+ *
+ * @return  number of byte sent
+ *          -1 for error or EOF
+ */
+ssize_t send_headers(int fd, rio_t *rio_buf, io_buf_t *io_buf, reqmeta_t *reqmeta)
+{
+    ssize_t nbyte = 0;
+    int rc;
+
+    do {
+        if ((rc = get_header(rio_buf, reqmeta, io_buf)) <= 0) /* EOF */
+            return -1;
+        if ((rc = rio_writen(fd, io_buf->linebuf, strlen(io_buf->linebuf))) < 0) /* error */
+            return -1;
+
+        nbyte += strlen(io_buf->linebuf);
+    } while (strncmp(CRLF, io_buf->linebuf, 2) != 0);
+
+    return nbyte;
+}
+
+/**
+ * @return -1 for error or EOF
+ */
+ssize_t send_body(int fd, rio_t *rio_buf, io_buf_t *io_buf, int content_len)
+{
+    ssize_t nbyte = 0;
+    int rc;
+    if ((rc = get_body(rio_buf, content_len, io_buf)) != 1)
+        return -1;
+
+    if ((rc = rio_writen(fd, io_buf->bodybuf, content_len)) < 0) /* error */
+        return -1;
+
+    nbyte += content_len;
+
+    return nbyte;
+}
+
 void write_log(FILE *fp, char *logstring)
 {
     fprintf(fp, "%s\n", logstring);
+    fflush(fp);
 }
 
 /**
  * read a header in io_buf.linebuf
  * @return
- *         0 for EOF
+ *         0 for EOF or error
  *         1 for successfully read a header
- *         2 for CRLF
  */
-int get_header(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
+int get_header(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf)
 {
     /* parse all headers */
     char *delim;
 
-    if (Rio_readlineb(rio_buf, io_buf->linebuf, MAXBUF) == 0)
+    if (rio_readlineb(rio_buf, io_buf->linebuf, MAXBUF) <= 0)
         return 0;
 
-    /* encounter the CRLF following headers */
+    /* encounter the CRLF following headers
     if (strncmp(CRLF, io_buf->linebuf, strlen(CRLF)) == 0)
         return 2;
+    */
 
     /* encounter "Content-Length" means there is payload in the request */
     if (strncmp(CONTENT_LENGTH, io_buf->linebuf, strlen(CONTENT_LENGTH)) == 0) {
         delim = strchr(io_buf->linebuf, ':');
-        httpmeta->content_len = atoi(delim + 1);
+        reqmeta->content_len = atoi(delim + 1);
     }
 
     return 1;
 }
 
 /**
- * @return 0 for EOF
+ * @return 0 for error or EOF
  *         1 successfully read the body
- *         2 for read noting
  */
-int get_body(rio_t *rio_buf, httpmeta_t *httpmeta, io_buf_t *io_buf)
+int get_body(rio_t *rio_buf, int content_len, io_buf_t *io_buf)
 {
-    if (httpmeta->content_len <= 0)
-        return 2;
-
-    if (Rio_readnb(rio_buf, io_buf->bodybuf, httpmeta->content_len) == 0)
+    if (rio_readnb(rio_buf, io_buf->bodybuf, content_len) < 0)
         return 0;
     else
         return 1;

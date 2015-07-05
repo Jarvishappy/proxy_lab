@@ -5,17 +5,23 @@ Milestone
 3. 改造成多线程版本
 
 2015-7-4
-
+实现了最简单的echo client, echo server。
 1. 读socket的时候，read()返回0代表什么？
 答：表示peer socket关闭了(EOF, no more data to be read)。如果是server检测到
 这个事件，那么server就应该把clientfd给关闭。server可以继续往这个clientfd写入数据，
 不会报错。
 
-2. 写入一个closed socket，会报什么错?
-答：write() return -1 and set errno to EBADF
+2. write()一个closed socket，会报什么错?
+答：write() return -1 and set errno to EBADF. proxy lab的handout pdf中说的是EPIPE
 
 3. read()一个closed socket会报什么错？
-答：read() return -1 and set errno to EBADF
+答：read() return -1 and set errno to EBADF. proxy lab的handout pdf中说的是ECONNRESET
 
+
+2015-7-5
+实现了proxy的核心功能: proxy。
+代码结构很混乱，有很多重复的代码(读取request和response的header，body的代码可以提取
+成一个function)。
+考虑能否用select()消除重复代码，让代码变得更加简洁。
 
 
