@@ -4,19 +4,19 @@ HANDINDIR = /afs/cs/academic/class/15213-f02/L7/handin
 
 CC = gcc
 CFLAGS = -Wall -O0 -g
-#LDFLAGS = -lpthread
-FILES = client server
+LDFLAGS = -lpthread
+FILES = proxy
 
 all: $(FILES)
 
-server: rio.o
+proxy: csapp.o
 
-rio.o: rio.h rio.c
+csapp.o: csapp.h csapp.c
 
 
 handin:
 	cp proxy.c $(HANDINDIR)/$(TEAM)-$(VERSION)-proxy.c
 
 clean:
-	rm -f ./*.o ./client ./server
+	rm -f ./*.o ./proxy
 

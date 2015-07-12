@@ -10,6 +10,8 @@
  * function that describes what that function does.
  */
 
+#include <execinfo.h>
+#include <signal.h>
 #include "csapp.h"
 #define DBG(x) do { printf("%s:%d - ", __func__, __LINE__); printf x; \
     putchar('\n'); fflush(stdout); } while(0);
@@ -39,6 +41,19 @@ typedef struct {
     char bodybuf[MAXBUF];
 } io_buf_t;
 
+void handler(int sig) {
+    void *array[10];
+    size_t size;
+
+    // get void*'s for all entries on the stack
+    size = backtrace(array, 10);
+
+    // print out all the frames to stderr
+    fprintf(stderr, "Error: signal %d:\n", sig);
+    backtrace_symbols_fd(array, size, STDERR_FILENO);
+    exit(1);
+}
+
 /*
  * Function prototypes
  */
@@ -54,35 +69,56 @@ int parse_request_line(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf)
     if (Rio_readlineb(rio_buf, io_buf->linebuf, MAXLINE) == 0)
         return 0;
 
-    char *p = io_buf->linebuf;
-    char *delim;
+    /* check if a valid request line */
+    if (strstr(io_buf->linebuf, "HTTP") == NULL)
+        return -1;
 
-    delim = strchr(p, ' ');
-    *delim = '\0';
-    /* p points to the method */
-    strncpy(reqmeta->method, p, strlen(p) + 1);
+    char skipbuf[64];
+    sscanf(io_buf->linebuf, "%s %s %s", reqmeta->method, reqmeta->uri, skipbuf);
 
-    p = delim + 1;
-    delim = strchr(p, ' ');
-    *delim = '\0';
-    /* p points to the uri */
-    strncpy(reqmeta->uri, p, strlen(p) + 1);
-    parse_uri(p, reqmeta->host, reqmeta->path, &reqmeta->port);
+/*     char *p = io_buf->linebuf;
+ *     char *delim;
+ * 
+ *     delim = strchr(p, ' ');
+ *     if (!delim)
+ *         return -1;
+ * 
+ *     *delim = '\0';
+ *     [> p points to the method <]
+ *     strncpy(reqmeta->method, p, strlen(p) + 1);
+ * 
+ *     p = delim + 1;
+ *     delim = strchr(p, ' ');
+ *     if (!delim)
+ *         return -1;
+ * 
+ *     *delim = '\0';
+ *     [> p points to the uri <]
+ *     strncpy(reqmeta->uri, p, strlen(p) + 1); */
+    parse_uri(reqmeta->uri, reqmeta->host, reqmeta->path, &reqmeta->port);
 
     return 1;
 }
 
 int get_header(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf);
-int get_body(rio_t *rio_buf, int content_len, io_buf_t *io_buf);
+int get_body(rio_t *rio_buf, io_buf_t *io_buf, int content_len);
 
 ssize_t send_headers(int fd, rio_t *rio_buf, io_buf_t *io_buf, reqmeta_t *reqmeta);
-ssize_t send_body(int fd, rio_t *rio_buf, io_buf_t *io_buf, int content_len);
+int send_body(int fd, rio_t *rio_buf, io_buf_t *io_buf, int content_len);
+
+void clear_reqmeta(reqmeta_t *reqmeta)
+{
+    memset(reqmeta, 0, sizeof(*reqmeta));
+}
 
 /*
  * main - Main routine for the proxy program
  */
 int main(int argc, char **argv)
 {
+    signal(SIGSEGV, handler);
+    /* ignore SIGPIPE signaled when write to closed socket */
+    signal(SIGPIPE, SIG_IGN);
 
     int port;
     /* Check arguments */
@@ -99,62 +135,71 @@ int main(int argc, char **argv)
     /* open listenning fd */
     listenfd = Open_listenfd(port);
 
-    /* char logstring[MAXBUF] = {0}; */
-    FILE *flogp = fopen("proxy.log", "a+");
+    FILE *flogp = fopen("proxy.log", "a");
     if (!flogp)
         unix_error("fopen");
 
     printf("server: started on port: %d.\n", port);
 
     /* we only need two buffer */
-    rio_t rio_buf;
+    rio_t browser_buf;
+    rio_t target_buf;
     io_buf_t io_buf;
     char logstring[MAXLINE];
     ssize_t nbyte;
     int rc;
 
+    reqmeta_t reqmeta;
+    memset(&reqmeta, 0, sizeof(reqmeta));
     while (1) {
         browserfd = Accept(listenfd, (struct sockaddr *)&browser_addr, &addrlen);
         DBG(("accept a new connection"));
 
-        reqmeta_t reqmeta;
-        memset(&reqmeta, 0, sizeof(reqmeta));
-        Rio_readinitb(&rio_buf, browserfd);
+        Rio_readinitb(&browser_buf, browserfd);
 
         while (1) {
             /* parse request line */
-            rc = parse_request_line(&rio_buf, &reqmeta, &io_buf);
+            rc = parse_request_line(&browser_buf, &reqmeta, &io_buf);
             if (rc == 0) {
-                DBG(("parse_request_line encounter EOF"));
+                DBG(("browser socket has been closed"));
                 break;
             }
+            if (rc == -1)
+                continue;
 
             /* connect to target server */
+            DBG(("host: %s, port: %d", reqmeta.host, reqmeta.port));
             targetfd = Open_clientfd(reqmeta.host, reqmeta.port);
+            /* TODO: set the accepted socket to non-blocking  */
+
 
             /* send HTTP request to target server */
             /* request line */
             sprintf(io_buf.linebuf, "%s %s HTTP/1.1\r\n", reqmeta.method, reqmeta.path);
+            DBG(("sent request line: %s, length: %ld", io_buf.linebuf, strlen(io_buf.linebuf)));
             Rio_writen(targetfd, io_buf.linebuf, strlen(io_buf.linebuf));
+            reqmeta.content_len = 0;
+
             /* headers */
-            if (send_headers(targetfd, &rio_buf, &io_buf, &reqmeta) == -1 ||
-                send_body(targetfd, &rio_buf, &io_buf, reqmeta.content_len) == -1)
+            if (send_headers(targetfd, &browser_buf, &io_buf, &reqmeta) == -1 ||
+                send_body(targetfd, &browser_buf, &io_buf, reqmeta.content_len) == -1)
                 break;
 
             DBG(("forwarded request to target server"));
 
             /**** send response back to browser *****/
-            Rio_readinitb(&rio_buf, targetfd);
+            Rio_readinitb(&target_buf, targetfd);
             ssize_t rc;
             nbyte = 0;
+            reqmeta.content_len = 0;
 
-            if ((rc = send_headers(browserfd, &rio_buf, &io_buf, &reqmeta)) == -1)
+            if ((rc = send_headers(browserfd, &target_buf, &io_buf, &reqmeta)) == -1)
                 break;
             nbyte += rc;
 
-            if ((rc = send_body(browserfd, &rio_buf, &io_buf, reqmeta.content_len)) == -1)
+            if (!send_body(browserfd, &target_buf, &io_buf, reqmeta.content_len))
                 break;
-            nbyte += rc;
+            nbyte += reqmeta.content_len;
 
             /* logging to file */
             format_log_entry(logstring, &browser_addr, reqmeta.uri, nbyte);
@@ -162,14 +207,14 @@ int main(int argc, char **argv)
 
             DBG(("log to file"));
         }
-        DBG(("browser closed the socket"));
         Close(browserfd);
+        Close(targetfd);
 
     }
 
     Close(listenfd);
     fclose(flogp);
-    printf("done\n");
+    printf("server exits\n");
     exit(0);
 }
 
@@ -183,9 +228,15 @@ ssize_t send_headers(int fd, rio_t *rio_buf, io_buf_t *io_buf, reqmeta_t *reqmet
     ssize_t nbyte = 0;
     int rc;
 
+    /* add proxy header */
+    /* sprintf(io_buf->linebuf, "%s: %s\r\n", "X-SIYUAN-PROXY", "Siyuan Wang");
+     * if ((rio_writen(fd, io_buf->linebuf, strlen(io_buf->linebuf)) < 0))
+     *     return -1; */
+
     do {
         if ((rc = get_header(rio_buf, reqmeta, io_buf)) <= 0) /* EOF */
             return -1;
+
         if ((rc = rio_writen(fd, io_buf->linebuf, strlen(io_buf->linebuf))) < 0) /* error */
             return -1;
 
@@ -196,21 +247,25 @@ ssize_t send_headers(int fd, rio_t *rio_buf, io_buf_t *io_buf, reqmeta_t *reqmet
 }
 
 /**
- * @return -1 for error or EOF
+ * @return 1 for successfully
+ *         0 for error
  */
-ssize_t send_body(int fd, rio_t *rio_buf, io_buf_t *io_buf, int content_len)
+int send_body(int fd, rio_t *rio_buf, io_buf_t *io_buf, int content_len)
 {
-    ssize_t nbyte = 0;
+    ssize_t nleft = content_len;
     int rc;
-    if ((rc = get_body(rio_buf, content_len, io_buf)) != 1)
-        return -1;
 
-    if ((rc = rio_writen(fd, io_buf->bodybuf, content_len)) < 0) /* error */
-        return -1;
+    /* 这里要循环的读入bodybuf，因为content_len会比bodybuf大！ */
+    while (nleft > 0) {
+        if ((rc = rio_readnb(rio_buf, io_buf->bodybuf, nleft > MAXBUF ? MAXBUF : nleft)) < 0)
+            return 0;
 
-    nbyte += content_len;
+        if ((rc = rio_writen(fd, io_buf->bodybuf, rc)) < 0) /* error */
+            return 0;
+        nleft -= rc;
+    }
 
-    return nbyte;
+    return 1;
 }
 
 void write_log(FILE *fp, char *logstring)
@@ -230,16 +285,12 @@ int get_header(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf)
     /* parse all headers */
     char *delim;
 
-    if (rio_readlineb(rio_buf, io_buf->linebuf, MAXBUF) <= 0)
+    if (rio_readlineb(rio_buf, io_buf->linebuf, MAXLINE) <= 0)
         return 0;
-
-    /* encounter the CRLF following headers
-    if (strncmp(CRLF, io_buf->linebuf, strlen(CRLF)) == 0)
-        return 2;
-    */
 
     /* encounter "Content-Length" means there is payload in the request */
     if (strncmp(CONTENT_LENGTH, io_buf->linebuf, strlen(CONTENT_LENGTH)) == 0) {
+        DBG(("%s", io_buf->linebuf));
         delim = strchr(io_buf->linebuf, ':');
         reqmeta->content_len = atoi(delim + 1);
     }
@@ -251,9 +302,9 @@ int get_header(rio_t *rio_buf, reqmeta_t *reqmeta, io_buf_t *io_buf)
  * @return 0 for error or EOF
  *         1 successfully read the body
  */
-int get_body(rio_t *rio_buf, int content_len, io_buf_t *io_buf)
+int get_body(rio_t *rio_buf, io_buf_t *io_buf, int bufsize)
 {
-    if (rio_readnb(rio_buf, io_buf->bodybuf, content_len) < 0)
+    if (rio_readnb(rio_buf, io_buf->bodybuf, bufsize) < 0)
         return 0;
     else
         return 1;
