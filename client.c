@@ -7,7 +7,7 @@
  * print the message to stdout
  *
  */
-#include "netlib.h"
+#include "csapp.h"
 
 #define SERV_HOST   "127.0.0.1"
 #define SERV_PORT   8888
@@ -24,7 +24,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    fd = open_clientfd(argv[1], atoi(argv[2]));
+    fd = Open_clientfd(argv[1], atoi(argv[2]));
 
     /* 2. read message from stdin */
     char *linep = NULL;
@@ -34,9 +34,14 @@ int main(int argc, char *argv[])
     /**
      * 读socket的时候，read()返回0表示socket关闭了(EOF, no more data to be read)
      * 写入一个closed socket，会报什么错？write() return -1 and set errno to EBADF
+     * or EPIPE
      *
      */
     while (getline(&linep, &len, stdin) != -1) {
+        if (strncmp("CLOSE", linep, 5) == 0) {
+            printf("client initiate CLOSE\n");
+            break;
+        }
         /* 3. write message to server */
         len = strlen(linep);
         write_to(fd, linep, len);
@@ -79,12 +84,12 @@ int read_from(int fd, char *buf, const int size)
 }
 
 /**
- * write all byte in buf to fd
+ * write n byte in buf to fd
  */
-void write_to(int fd, char *buf, const int size)
+void write_to(int fd, char *buf, const int n)
 {
     ssize_t nwritten;
-    ssize_t nleft = size;
+    ssize_t nleft = n;
     char *bufp = buf;
 
     while (nleft > 0) {

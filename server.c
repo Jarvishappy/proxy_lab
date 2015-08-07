@@ -7,36 +7,36 @@
  *
  */
 
-#include "netlib.h"
-#include "rio.h"
+#include "csapp.h"
 
 #define PORT        8888
 #define BUFSIZE     256
+#define HELLO "Hello"
 
 
 int main(int argc, char *argv[])
 {
-    int listenfd = open_listenfd(PORT);
+    int listenfd = Open_listenfd(PORT);
 
     int clientfd;
     struct sockaddr_in client_addr;
     socklen_t addrlen = sizeof(client_addr);
     char buf[BUFSIZE] = {0};
     int nread;
+    rio_t rbuf;
 
 
     printf("server: started on port: %d.\n", PORT);
 
     while (1) {
-        clientfd = accept(listenfd, (struct sockaddr *)&client_addr, &addrlen);
-        if (clientfd < 0)
-            unix_error("accept");
+        clientfd = Accept(listenfd, (struct sockaddr *)&client_addr, &addrlen);
+        Rio_readinitb(&rbuf, clientfd);
         printf("server: accept a new connection\n");
 
-        while ((nread = rio_readlinen(clientfd, buf, BUFSIZE)) > 0) {
+        while ((nread = Rio_readlineb(&rbuf, buf, BUFSIZE)) > 0) {
             printf("server: received \"%s\", nread: %d\n", buf, nread);
-            if (rio_writen(clientfd, buf, nread) < 0)
-                unix_error("rio_writen");
+
+            Rio_writen(clientfd, buf, strlen(buf));
         }
 
         if (nread == -1)
@@ -44,13 +44,12 @@ int main(int argc, char *argv[])
         else if (nread == 0) { /* client socket has been closed */
             printf("server: client socket has been closed.\n");
 
-            if (close(clientfd) != 0)
-                unix_error("close");
+            Close(clientfd);
         }
     }
 
 
-
+    Close(listenfd);
 
     return 0;
 }
