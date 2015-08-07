@@ -30,8 +30,8 @@ http://www.taobao.com/ HTTP/1.1时报了segmentation fault。
 
 2015-7-11
 有多个bug导致了segmentation fault：
-1. parse_request_line()的delim=strchr(io_buf->linebuf, ‘ ‘);
-这一句，strchr()没有找到’ ‘，返回NULL，然后下面没有判断delim是否不为NULL，直接*delim=‘\0’了
+1. parse_request_line()的delim=strchr(io_buf->linebuf, ' ');
+这一句，strchr()没有找到' '，返回NULL，然后下面没有判断delim是否不为NULL，直接*delim='\0'了
 
 2. 然后，根本的原因竟然是在send_body()里，send_body需要从target server的响应中读出body，
 然后再写回给浏览器，读的时候我是一次性读content_len个字节的，但是很明显，content_len有时
@@ -43,5 +43,25 @@ http://www.taobao.com/ HTTP/1.1时报了segmentation fault。
 解决办法：
 1. 把socket搞成non-blocking的，这样子read()读不到数据的时候就不会一直blcoked住了！
 2. 不使用buffered的IO，只用unbuffered的read()
+
+
+2015-7-12
+1. 多线程环境下，如何保证每个thread有private的errno，不修改别的thread的errno？
+答：errno在Linux下是thread-safe的，POSIX标准也规定了errno必须是thread-specific的。
+
+1. Thread per connection
+每次accept到一个connection，就创建一个thread，把fd丢给thread
+
+2. Thread per request
+
+
+先实现最简单的thread per connection
+
+2015-7-18
+今天outing，没有网络，测试好麻烦。在ubuntu里开了个python web server，用telnet测了一下，
+接收到新的连接之后可以成功的创建worker thread。
+
+
+
 
 

@@ -19,4 +19,8 @@ handin:
 
 clean:
 	rm -f ./*.o ./proxy
-
+# Push sources to my Linux development machine
+PUSH_CONTENTS=proxy.c csapp.h csapp.c
+PUSH_DEST=siyuan@centos:projects/proxy_lab
+push:
+	rsync -auv --filter=':- .gitignore' $(PUSH_CONTENTS) $(PUSH_DEST)
