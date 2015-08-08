@@ -62,6 +62,56 @@ http://www.taobao.com/ HTTP/1.1时报了segmentation fault。
 接收到新的连接之后可以成功的创建worker thread。
 
 
+2015-8-8
+1. Proxy转发请求过去之后，返回的响应是Bad Request
+多线程版本把请求转发给target server（如sina.com.cn, aol.com）之后，收到的响应分别是
+Access Denied，Bad Request。于是我就推测有可能是proxy发过去的HTTP报文格式不对，导致
+服务端无法正常解析。基于Principle of Confirmation，我需要去验证proxy发给target server
+的报文，于是我就用Wireshark来抓包，需要注意的是在启动capture之前可以在interface上设置
+capture filter，而capture filter的语法跟display filter的语法是不同的！
+
+最初我的display filter指定了tcp.port==15213（15213是proxy的listen port），这样只能
+capture到浏览器发送给proxy的报文，而无法capture到proxy发送给target server的报文。
+要获取proxy转发过去的报文，我需要知道proxy_worker()中Open_clientfd()打开的socket
+的port。这样我才能过滤去我真正想要的报文。
+
+最后发现proxy发过去的报文果然是有问题的，request line的最后少了CRLF：
+
+正确的：GET / HTTP/1.1\r\n
+错误的：GET / HTTP/1.1
+
+原因是parse_request_line()中的这一句:
+
+    sscanf(io_buf->linebuf, "%s %s %s", reqline->method, reqline->uri, reqline->versionCRLF);
+
+versionCRLF中存的是"HTTP/1.1"而不是"HTTP/1.1\r\n"，根本原因是scanf的%s只匹配非空白符，空白符之后的直接被忽略了。
+再举个例子：
+scanf("%s", input) 这一句从stdin读入一个字符串到input中。
+假设你输入的是hello world，那么最终存到input中的是"hello"
+
+
+2. www.aol.com返回的响应中没有Content-Length头
+原因是server端采用的是chunked encoding的方式返回响应，由HTTP头Transfer-Encoding: chunked指定。
+HTTP标准规定server采用chunked encoding的方式返回响应时，是没有Content-Length头的，因为
+server把一整个完整的响应拆分成了一个一个的chunk，此时HTTP Response的格式为：
+
+HTTP-Response  =   HTTP-Headers
+                   CRLF
+                   Chunked-Body
+
+Chunked-Body   =   *chunk
+                   last-chunk
+                   trailer-part
+                   CRLF
+
+chunk          = chunk-size *WSP [ chunk-ext ] CRLF
+                 chunk-data CRLF
+chunk-size     = 1*HEXDIG
+chunk-data     = 1*OCTET ; a sequence of chunk-size octets
+last-chunk     = 1*("0") *WSP [ chunk-ext ] CRLF
+
+chunk-size就是一个十六进制数，表示的是这个chunk的大小。
+
 
 
 
