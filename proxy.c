@@ -1,4 +1,5 @@
 /*
+ * Hello World
  * proxy.c - CS:APP Web proxy
  *
  * TEAM MEMBERS:
@@ -14,17 +15,26 @@
 #include <execinfo.h>
 #include <signal.h>
 #include "csapp.h"
+
+#define PROXY_DEBUG
+
+#ifdef PROXY_DEBUG
 #define DBG(x) do { printf("%s:%d - ", __func__, __LINE__); printf x; \
     putchar('\n'); fflush(stdout); } while(0);
+#else
+#define DBG(x)
+#endif
 
 #define LOG_ERROR(x) do { printf("ERROR: %s:%d - ", __func__, __LINE__); printf x; \
     putchar('\n'); fflush(stdout); } while(0);
 
-#define MAXTHREAD 2
+#define MAXTHREAD 100
 #define MAXHEAD 30
 #define CRLF "\r\n"
 #define CONTENT_LENGTH "Content-Length"
 #define HOST "Host"
+
+#define LOGGER_MUTEX "logger_mutex"
 
 /**
  * Represents a HTTP request
@@ -35,7 +45,7 @@
 typedef struct http_reqline {
     int port;
     char method[5];
-    char versionCRLF[10];
+    char versionCRLF[12];
     char host[128];
     char path[1024];
     char uri[MAXLINE];
@@ -48,7 +58,7 @@ typedef struct io_buf {
 
 typedef struct proxy_logger {
     FILE *fp;
-    sem_t mutex;
+    pthread_mutex_t *mutex;
 } proxy_logger_t;
 
 
@@ -58,11 +68,11 @@ typedef void*(thread_func_t)(void*);
 typedef struct thread_context {
     int connfd; /* connection fd */
     int tid;    /* thread id */
-    struct sockaddr_in conn_addr;
     proxy_logger_t *logger;
 
 } thread_context_t;
 
+static pthread_mutex_t logger_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void segv_handler(int sig) {
     void *array[10];
@@ -142,7 +152,7 @@ int main(int argc, char **argv)
         browserfd = Accept(listenfd, (struct sockaddr *)&browser_addr, &addrlen);
         DBG(("accept a new connection"));
 
-        if (thread_no > MAXTHREAD) {
+        if (thread_no >= MAXTHREAD) {
             LOG_ERROR(("thread pool is full, drop new connection"));
             Close(browserfd);
             continue;
@@ -158,7 +168,6 @@ int main(int argc, char **argv)
         }
 
         thread_ctxp->connfd = browserfd;
-        thread_ctxp->conn_addr = browser_addr;
         thread_ctxp->tid = thread_no++;
         thread_ctxp->logger = loggerp;
 
@@ -168,8 +177,10 @@ int main(int argc, char **argv)
             free_thread_context(thread_ctxp);
             continue;
         }
+        DBG(("create worker success"));
     }
 
+    destroy_gethostbyname_mutex();
     Close(listenfd);
     free_proxy_logger(loggerp);
     printf("server exits\n");
@@ -194,12 +205,27 @@ void *proxy_worker(void* arg)
     http_reqline_t reqline;
     Rio_readinitb(&rbuf, thread_ctxp->connfd);
 
+    struct sockaddr_in remotecli_sock;
+    socklen_t remotecli_socklen = sizeof(remotecli_sock);
+
     while (1) {
         if ((rc = parse_request_line(&rbuf, &reqline, &iobuf)) == 0)
             goto terminate;
 
+        DBG(("parsed request line"));
+
         /* connect to remote server */
-        remotefd = Open_clientfd(reqline.host, reqline.port);
+        remotefd = Open_clientfd_ts(reqline.host, reqline.port);
+
+
+        if (getsockname(remotefd, (SA*)&remotecli_sock, &remotecli_socklen) < 0) {
+            print_err(errno, "getsockname");
+            goto terminate;
+        }
+
+        /* print out ephemeral socket port */
+        DBG(("remote client socket port: %d", ntohs(remotecli_sock.sin_port)));
+
         /* send request line to remote server */
         if (!send_reqline(remotefd, &iobuf, &reqline))
             goto terminate;
@@ -211,6 +237,8 @@ void *proxy_worker(void* arg)
             LOG_ERROR(("send headers or body to remote host fail"));
             goto terminate;
         }
+
+        DBG(("forwarded request to remote server"));
 
         Rio_readinitb(&rbuf, remotefd);
 
@@ -227,9 +255,17 @@ void *proxy_worker(void* arg)
             LOG_ERROR(("send body to browser fail"));
             goto terminate;
         }
-        nbyte += rc;
+        nbyte += content_len;
 
-        format_log_entry(logstring, &thread_ctxp->conn_addr, reqline.uri, nbyte);
+        DBG(("returned response to browser"));
+
+        struct sockaddr_in conn_addr;
+        socklen_t socklen = sizeof(conn_addr);
+        if ((rc = getpeername(thread_ctxp->connfd, (SA*)&conn_addr, &socklen)) < 0) {
+            print_err(errno, "getpeername");
+            goto terminate;
+        }
+        format_log_entry(logstring, &conn_addr, reqline.uri, nbyte);
         dolog(thread_ctxp->logger, logstring);
     }
 
@@ -253,7 +289,7 @@ int parse_request_line(rio_t *rio_buf, http_reqline_t *reqline, io_buf_t *io_buf
         strstr(io_buf->linebuf, "HTTP") == NULL)
         return 0;
 
-    sscanf(io_buf->linebuf, "%s %s %s", reqline->method, reqline->uri, reqline->versionCRLF);
+    sscanf(io_buf->linebuf, "%s %s %10[A-Z/0-9.\r\n]", reqline->method, reqline->uri, reqline->versionCRLF);
     parse_uri(reqline->uri, reqline->host, reqline->path, &reqline->port);
 
     return 1;
@@ -337,27 +373,32 @@ proxy_logger_t *proxy_logger(const char *filename)
     }
 
     loggerp->fp = fp;
-    /* OSX好像没有实现这个函数 */
-    if (sem_init(&loggerp->mutex, 0, 1) < 0) {
-        print_err(errno, "sem_init");
-        return NULL;
-    }
+    /* use pthread mutex instead of semaphore on OSX  */
+    loggerp->mutex = &logger_lock;
 
     return loggerp;
 }
 
 void dolog(proxy_logger_t *loggerp, char *logstring)
 {
-    sem_wait(&loggerp->mutex);
+    int rc = 0;
+    if ((rc = pthread_mutex_lock(loggerp->mutex)) != 0)
+        print_err(rc, "pthread_mutex_lock");
+
     fprintf(loggerp->fp, "%s\n", logstring);
     fflush(loggerp->fp);
-    sem_post(&loggerp->mutex);
+    if ((rc = pthread_mutex_unlock(loggerp->mutex)) != 0)
+        print_err(rc, "pthread_mutex_unlock");
 }
 
 void free_proxy_logger(proxy_logger_t *loggerp)
 {
     if (NULL == loggerp)
         return;
+
+    int rc = 0;
+    if ((rc = pthread_mutex_destroy(loggerp->mutex)) != 0)
+        print_err(rc, "pthread_mutex_destroy");
 
     fclose(loggerp->fp);
     free(loggerp);
@@ -409,9 +450,14 @@ int get_header(rio_t *rio_buf, io_buf_t *io_buf, int *content_lenp)
 {
     /* parse all headers */
     char *delim;
+    int rc;
 
-    if (rio_readlineb(rio_buf, io_buf->linebuf, MAXLINE) <= 0)
+    if ((rc = rio_readlineb(rio_buf, io_buf->linebuf, MAXLINE) <= 0)) {
+        if (rc < 0)
+            print_err(errno, "rio_readlineb");
+
         return 0;
+    }
 
     /* encounter "Content-Length" means there is payload in the request */
     if (strncmp(CONTENT_LENGTH, io_buf->linebuf, strlen(CONTENT_LENGTH)) == 0) {
